@@ -1,8 +1,9 @@
-let uploadedVideos = {}; // {index: filename}
+let videoSources = {}; // {index: {label, type, source}}
 let activeStreams = new Set();
 let queryImages = [];
 let statusInterval = null;
 let paramUpdateTimer = null;
+let availableCameras = [];
 
 const panelCount = 4;
 
@@ -25,6 +26,7 @@ document.addEventListener('DOMContentLoaded', () => {
     fetchStatus();
     statusInterval = setInterval(fetchStatus, 3000);
     bindParamControls();
+    fetchCameras();
 });
 
 function bindParamControls() {
@@ -125,14 +127,18 @@ function updateVideoStateFromStatus(videoDetails) {
     const latestIndices = new Set();
     videoDetails.forEach(item => {
         latestIndices.add(item.index);
-        uploadedVideos[item.index] = item.filename;
-        showVideoReady(item.index, item.filename, item.active);
+        videoSources[item.index] = {
+            label: item.label || item.filename || `通道 ${item.index + 1}`,
+            type: item.type || 'file',
+            source: item.source
+        };
+        showVideoReady(item.index, videoSources[item.index].label, item.active);
     });
 
-    Object.keys(uploadedVideos).forEach(idx => {
+    Object.keys(videoSources).forEach(idx => {
         if (!latestIndices.has(Number(idx))) {
             resetVideoSlot(Number(idx));
-            delete uploadedVideos[idx];
+            delete videoSources[idx];
         }
     });
 
@@ -202,8 +208,8 @@ async function uploadVideo(event) {
         const res = await fetch('/api/upload_video', { method: 'POST', body: form });
         const data = await res.json();
         if (!data.success) throw new Error(data.message);
-        uploadedVideos[slot] = data.filename;
-        showVideoReady(slot, data.filename, false);
+        videoSources[slot] = { label: data.label, type: data.type, source: null };
+        showVideoReady(slot, data.label, false);
         updateVideoList();
     } catch (err) {
         alert('上传失败: ' + err.message);
@@ -211,19 +217,109 @@ async function uploadVideo(event) {
     event.target.value = '';
 }
 
+async function fetchCameras() {
+    try {
+        const res = await fetch('/api/list_cameras');
+        const data = await res.json();
+        if (!data.success) throw new Error(data.message || '获取失败');
+        availableCameras = data.cameras || [];
+        renderCameraOptions();
+    } catch (err) {
+        console.error('摄像头列表获取失败', err);
+    }
+}
+
+function renderCameraOptions() {
+    const select = document.getElementById('cameraSelect');
+    if (!select) return;
+    select.innerHTML = '';
+    availableCameras.forEach(cam => {
+        const option = document.createElement('option');
+        option.value = cam.id;
+        option.textContent = cam.name;
+        select.appendChild(option);
+    });
+    const customOption = document.createElement('option');
+    customOption.value = 'custom';
+    customOption.textContent = '自定义源...';
+    select.appendChild(customOption);
+}
+
+function refreshCameras() {
+    fetchCameras();
+}
+
+async function assignCamera() {
+    const slot = findAvailableSlot();
+    if (slot === -1) {
+        alert('通道已满，请先删除一个视频或摄像头');
+        return;
+    }
+    const select = document.getElementById('cameraSelect');
+    if (!select) {
+        alert('摄像头选择器不存在');
+        return;
+    }
+
+    let cameraId = select.value;
+    if (!cameraId) {
+        alert('请选择摄像头');
+        return;
+    }
+
+    let labelInput = document.getElementById('cameraLabel');
+    let customInput = document.getElementById('cameraCustom');
+    let label = labelInput ? labelInput.value.trim() : '';
+
+    if (cameraId === 'custom') {
+        const customValue = customInput ? customInput.value.trim() : '';
+        if (!customValue) {
+            alert('请输入自定义摄像头 URI 或管线');
+            return;
+        }
+        cameraId = customValue;
+        if (!label) label = '自定义摄像头';
+    } else {
+        const selectedOption = select.selectedOptions[0];
+        if (!label && selectedOption) {
+            label = selectedOption.textContent;
+        }
+    }
+
+    const payload = { camera_id: cameraId, video_index: slot, label };
+
+    try {
+        const res = await fetch('/api/assign_camera', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.message);
+        videoSources[slot] = { label: data.label, type: data.type, source: cameraId };
+        showVideoReady(slot, data.label, false);
+        updateVideoList();
+        if (labelInput) labelInput.value = '';
+        if (customInput) customInput.value = '';
+    } catch (err) {
+        alert('绑定摄像头失败: ' + err.message);
+    }
+}
+
 function findAvailableSlot() {
     for (let i = 0; i < panelCount; i++) {
-        if (!(i in uploadedVideos)) return i;
+        if (!(i in videoSources)) return i;
     }
     return -1;
 }
 
-function showVideoReady(index, filename, active) {
+function showVideoReady(index, label, active) {
     const placeholder = document.getElementById(`placeholder-${index}`);
     const frame = document.getElementById(`videoFrame-${index}`);
     const status = document.getElementById(`panelStatus-${index}`);
     placeholder.style.display = 'none';
     frame.style.display = 'block';
+    frame.alt = label;
     if (active) {
         if (!activeStreams.has(index) || !frame.src) {
             frame.src = `/api/video_feed/${index}?t=${Date.now()}`;
@@ -233,7 +329,7 @@ function showVideoReady(index, filename, active) {
         activeStreams.add(index);
     } else {
         frame.src = '';
-        status.textContent = '已上传';
+        status.textContent = '已就绪';
         status.className = 'status-badge status-idle';
         activeStreams.delete(index);
     }
@@ -254,30 +350,31 @@ function resetVideoSlot(index) {
 function updateVideoList() {
     const list = document.getElementById('videoList');
     list.innerHTML = '';
-    Object.entries(uploadedVideos).forEach(([idx, name]) => {
+    Object.entries(videoSources).forEach(([idx, info]) => {
+        const typeLabel = info.type === 'camera' ? '摄像头' : '文件';
         const row = document.createElement('div');
         row.className = 'flex items-center justify-between text-xs bg-slate-800 px-3 py-2 rounded-lg';
-        row.innerHTML = `<span>通道 ${Number(idx) + 1}: ${name}</span>`;
+        row.innerHTML = `<span>通道 ${Number(idx) + 1} [${typeLabel}]: ${info.label}</span>`;
         list.appendChild(row);
     });
 }
 
 async function clearVideoSlot(index) {
-    if (!(index in uploadedVideos)) return;
+    if (!(index in videoSources)) return;
     await fetch(`/api/delete_video/${index}`, { method: 'DELETE' });
-    delete uploadedVideos[index];
+    delete videoSources[index];
     resetVideoSlot(index);
     updateVideoList();
 }
 
 async function startProcessing() {
-    if (Object.keys(uploadedVideos).length === 0) {
-        alert('请先上传视频');
+    if (Object.keys(videoSources).length === 0) {
+        alert('请先上传视频或绑定摄像头');
         return;
     }
     const params = getCurrentParams();
 
-    for (const idx of Object.keys(uploadedVideos)) {
+    for (const idx of Object.keys(videoSources)) {
         const res = await fetch(`/api/start_detection/${idx}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

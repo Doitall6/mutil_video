@@ -66,7 +66,7 @@ models_loaded = False
 models_loading = False
 
 video_contexts = {}  # idx -> {reader, queue, event, trajectory, params, stream_config, fps,...}
-uploaded_videos = {}  # idx -> absolute path
+video_sources = {}  # idx -> {'type': 'file'|'camera', 'source': path_or_id, 'label': str}
 video_lock = threading.Lock()
 model_lock = threading.Lock()
 
@@ -114,27 +114,31 @@ class cuda_context_scope:
 
 # ------------------------- 视频读取线程 -------------------------
 class VideoReader(threading.Thread):
-    def __init__(self, video_path: str, video_index: int, frame_queue: Queue, running_event: threading.Event):
+    def __init__(self, source, source_type: str, video_index: int, frame_queue: Queue, running_event: threading.Event):
         super().__init__(daemon=True)
-        self.video_path = video_path
+        self.source = source
+        self.source_type = source_type
         self.video_index = video_index
         self.frame_queue = frame_queue
         self.running_event = running_event
         self.cap = None
 
     def run(self):
-        self.cap = cv2.VideoCapture(self.video_path)
+        self.cap = cv2.VideoCapture(self.source)
         if not self.cap.isOpened():
-            logger.error("VideoReader-%s 无法打开视频: %s", self.video_index, self.video_path)
+            logger.error("VideoReader-%s 无法打开源: %s", self.video_index, self.source)
             return
 
-        logger.info("VideoReader-%s 开始读取 %s", self.video_index, self.video_path)
+        logger.info("VideoReader-%s 开始读取 %s (%s)", self.video_index, self.source, self.source_type)
         frame_counter = 0
 
         while self.running_event.is_set():
             ret, frame = self.cap.read()
             if not ret:
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                if self.source_type == 'file':
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                else:
+                    time.sleep(0.05)
                 continue
 
             frame_counter += 1
@@ -222,6 +226,31 @@ def parse_detection_params(data: dict, *, update_defaults: bool = False):
     return params
 
 
+def parse_camera_source(camera_id):
+    if isinstance(camera_id, int):
+        return camera_id
+    if camera_id is None:
+        return None
+    try:
+        return int(camera_id)
+    except (TypeError, ValueError):
+        if isinstance(camera_id, str):
+            camera_id = camera_id.strip()
+            if camera_id == '':
+                return None
+        return camera_id
+
+
+def list_available_cameras(max_devices: int = 6):
+    cameras = []
+    for idx in range(max_devices):
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            cameras.append({'id': idx, 'name': f'摄像头 {idx}'})
+        cap.release()
+    return cameras
+
+
 # ------------------------- Flask 路由 -------------------------
 @app.route('/')
 def index():
@@ -237,15 +266,18 @@ def api_initialize_models():
 @app.route('/api/status')
 def api_status():
     with video_lock:
-        active_videos = list(video_contexts.keys())
-        video_details = [
-            {
+        active_videos = set(video_contexts.keys())
+        video_details = []
+        for idx, info in video_sources.items():
+            label = info.get('label') or os.path.basename(str(info.get('source', '')))
+            video_details.append({
                 'index': idx,
-                'filename': os.path.basename(path),
-                'active': idx in active_videos
-            }
-            for idx, path in uploaded_videos.items()
-        ]
+                'label': label,
+                'filename': label,
+                'type': info.get('type', 'file'),
+                'source': info.get('source'),
+                'active': idx in active_videos,
+            })
 
     payload = get_query_payload()
 
@@ -410,37 +442,91 @@ def api_upload_video():
     save_path = save_dir / f"video_{video_index}_{int(time.time())}_{filename}"
     file.save(save_path)
 
+    source_info = {
+        'type': 'file',
+        'source': str(save_path),
+        'label': save_path.name,
+    }
     with video_lock:
-        uploaded_videos[video_index] = str(save_path)
+        stop_video_processing(video_index)
+        video_sources[video_index] = source_info
 
-    return jsonify({'success': True, 'video_index': video_index, 'filename': save_path.name})
+    return jsonify({'success': True, 'video_index': video_index, 'label': save_path.name, 'type': 'file'})
+
+
+@app.route('/api/list_cameras')
+def api_list_cameras():
+    try:
+        max_devices = int(request.args.get('max', 6))
+    except ValueError:
+        max_devices = 6
+    max_devices = max(1, min(max_devices, 16))
+    cameras = list_available_cameras(max_devices=max_devices)
+    return jsonify({'success': True, 'cameras': cameras})
+
+
+@app.route('/api/assign_camera', methods=['POST'])
+def api_assign_camera():
+    data = request.get_json() or {}
+    video_index = data.get('video_index')
+    try:
+        video_index = int(video_index)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'message': '缺少或非法的通道索引'})
+
+    camera_id = parse_camera_source(data.get('camera_id'))
+    if camera_id is None:
+        return jsonify({'success': False, 'message': '请选择有效的摄像头'})
+
+    label = data.get('label') or f'摄像头 {camera_id}'
+
+    with video_lock:
+        for idx, info in video_sources.items():
+            if idx != video_index and info.get('type') == 'camera' and info.get('source') == camera_id:
+                return jsonify({'success': False, 'message': '该摄像头已分配给其他通道'})
+
+        stop_video_processing(video_index)
+        video_sources[video_index] = {
+            'type': 'camera',
+            'source': camera_id,
+            'label': label,
+        }
+
+    return jsonify({'success': True, 'video_index': video_index, 'label': label, 'type': 'camera'})
 
 
 @app.route('/api/delete_video/<int:video_index>', methods=['DELETE'])
 def api_delete_video(video_index):
     with video_lock:
         stop_video_processing(video_index)
-        path = uploaded_videos.pop(video_index, None)
-    if path and os.path.exists(path):
-        os.remove(path)
+        info = video_sources.pop(video_index, None)
+    if info and info.get('type') == 'file':
+        path = info.get('source')
+        if path and os.path.exists(path):
+            os.remove(path)
     return jsonify({'success': True})
 
 
 def start_video_processing(video_index: int, params: dict):
     with video_lock:
-        if video_index not in uploaded_videos:
-            return False, '请先上传视频'
+        source_info = video_sources.get(video_index)
+        if not source_info:
+            return False, '请先上传视频或绑定摄像头'
 
         stop_video_processing(video_index)
 
         queue = Queue(maxsize=10)
         event = threading.Event()
         event.set()
-        video_path = uploaded_videos[video_index]
-        reader = VideoReader(video_path, video_index, queue, event)
+        source_value = source_info.get('source')
+        reader = VideoReader(source_value, source_info.get('type', 'file'), video_index, queue, event)
         reader.start()
 
-        stream_cfg = StreamConfig(stream_id=video_index, source=video_path, name=f"通道 {video_index + 1}")
+        stream_cfg = StreamConfig(
+            stream_id=video_index,
+            source=str(source_value),
+            name=source_info.get('label') or f"通道 {video_index + 1}"
+        )
         video_contexts[video_index] = {
             'reader': reader,
             'queue': queue,
