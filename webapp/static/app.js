@@ -7,6 +7,14 @@ let availableCameras = [];
 
 const panelCount = 4;
 
+// 折叠面板切换
+function toggleCollapse(header) {
+    const content = header.nextElementSibling;
+    const icon = header.querySelector('.collapse-icon');
+    content.classList.toggle('open');
+    icon.classList.toggle('open');
+}
+
 function initVideoPanels() {
     const grid = document.getElementById('videoGrid');
     const template = document.getElementById('videoPanelTemplate').content;
@@ -109,15 +117,15 @@ function updateModelIndicator(loaded, loading) {
 
 function updateQueryUI(images) {
     queryImages = images;
-    document.getElementById('queryCount').textContent = images.length;
+    document.getElementById('queryCount').textContent = `(${images.length})`;
     const container = document.getElementById('queryList');
     container.innerHTML = '';
     images.forEach(img => {
         const card = document.createElement('div');
-        card.className = 'relative group border border-slate-600 rounded overflow-hidden';
+        card.className = 'relative group border border-slate-200 rounded overflow-hidden shadow-sm';
         card.innerHTML = `
-            <img src="${img.thumbnail}" class="w-full h-24 object-cover" alt="query">
-            <button class="absolute top-1 right-1 text-xs bg-black/60 px-2 py-0.5 rounded hidden group-hover:block" onclick="deleteQuery('${img.id}')">删除</button>
+            <img src="${img.thumbnail}" class="w-full h-12 object-cover" alt="query">
+            <button class="absolute top-0 right-0 text-[10px] bg-white/90 px-1 rounded-bl hidden group-hover:block text-red-500 shadow" onclick="deleteQuery('${img.id}')">×</button>
         `;
         container.appendChild(card);
     });
@@ -193,26 +201,42 @@ async function deleteQuery(id) {
     updateQueryUI(data.query_images);
 }
 
-async function uploadVideo(event) {
-    const file = event.target.files[0];
-    if (!file) return;
-    const slot = findAvailableSlot();
-    if (slot === -1) {
+async function uploadVideos(event) {
+    const files = Array.from(event.target.files);
+    if (!files.length) return;
+
+    const availableSlots = [];
+    for (let i = 0; i < panelCount; i++) {
+        if (!(i in videoSources)) availableSlots.push(i);
+    }
+
+    if (availableSlots.length === 0) {
         alert('通道已满，请先删除一个视频');
+        event.target.value = '';
         return;
     }
-    const form = new FormData();
-    form.append('video', file);
-    form.append('video_index', slot);
-    try {
-        const res = await fetch('/api/upload_video', { method: 'POST', body: form });
-        const data = await res.json();
-        if (!data.success) throw new Error(data.message);
-        videoSources[slot] = { label: data.label, type: data.type, source: null };
-        showVideoReady(slot, data.label, false);
-        updateVideoList();
-    } catch (err) {
-        alert('上传失败: ' + err.message);
+
+    const filesToUpload = files.slice(0, availableSlots.length);
+    if (files.length > availableSlots.length) {
+        alert(`只有 ${availableSlots.length} 个空闲通道，将上传前 ${availableSlots.length} 个视频`);
+    }
+
+    for (let i = 0; i < filesToUpload.length; i++) {
+        const file = filesToUpload[i];
+        const slot = availableSlots[i];
+        const form = new FormData();
+        form.append('video', file);
+        form.append('video_index', slot);
+        try {
+            const res = await fetch('/api/upload_video', { method: 'POST', body: form });
+            const data = await res.json();
+            if (!data.success) throw new Error(data.message);
+            videoSources[slot] = { label: data.label, type: data.type, source: null };
+            showVideoReady(slot, data.label, false);
+            updateVideoList();
+        } catch (err) {
+            alert(`上传 ${file.name} 失败: ` + err.message);
+        }
     }
     event.target.value = '';
 }
@@ -351,10 +375,13 @@ function updateVideoList() {
     const list = document.getElementById('videoList');
     list.innerHTML = '';
     Object.entries(videoSources).forEach(([idx, info]) => {
-        const typeLabel = info.type === 'camera' ? '摄像头' : '文件';
+        const typeIcon = info.type === 'camera' ? 'fa-camera' : 'fa-file-video';
         const row = document.createElement('div');
-        row.className = 'flex items-center justify-between text-xs bg-slate-800 px-3 py-2 rounded-lg';
-        row.innerHTML = `<span>通道 ${Number(idx) + 1} [${typeLabel}]: ${info.label}</span>`;
+        row.className = 'flex items-center justify-between bg-slate-100 border border-slate-200 px-2 py-1 rounded text-slate-600';
+        row.innerHTML = `
+            <span class="truncate flex-1"><i class="fa-solid ${typeIcon} mr-1 text-slate-400"></i>通道${Number(idx) + 1}: ${info.label}</span>
+            <button class="text-slate-400 hover:text-red-500 ml-1" onclick="clearVideoSlot(${idx})"><i class="fa-solid fa-xmark"></i></button>
+        `;
         list.appendChild(row);
     });
 }
